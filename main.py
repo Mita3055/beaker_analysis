@@ -1,309 +1,222 @@
 import cv2
 import numpy as np
-import time
 import os
+import time
 import csv
+from datetime import datetime
+from pathlib import Path
 
-def capture_image(camera_index=0, filename=None, save_image=True):
-    """
-    Capture an image from the specified camera.
-    
-    Args:
-        camera_index (int): Index of the camera to use (default: 0)
-        filename (str): Output filename. If None, uses 'captured_image.jpg'
-        save_image (bool): Whether to save the image to file (default: True)
-    
-    Returns:
-        numpy.ndarray: The captured frame
-        
-    Raises:
-        RuntimeError: If camera cannot be opened or image capture fails
-    """
-    # Initialize camera
+# Globals
+crop_coords = None
+csv_path = None
+output_dir = None
+captures_dir = None
+camera_index = 0
+
+
+def initialize_camera(camera_index=0):
+    """Initialize and configure the camera"""
     cap = cv2.VideoCapture(camera_index)
-    
-    # Check if camera opened successfully
+
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera with index {camera_index}")
-    
-    # Set camera properties for better quality (optional)
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     
-    try:
-        # Capture frame
-        ret, frame = cap.read()
-        
-        if not ret or frame is None:
-            raise RuntimeError("Failed to capture image from camera")
-        
-        # Save image if requested
-        if save_image:
-            if filename is None:
-                filename = 'captured_image.jpg'
-            
-            # Ensure directory exists
-            directory = os.path.dirname(filename)
-            if directory and not os.path.exists(directory):
-                os.makedirs(directory)
-            
-            # Save the image
-            success = cv2.imwrite(filename, frame)
-            if not success:
-                raise RuntimeError(f"Failed to save image to {filename}")
-            
-            print(f"Image saved as {filename}")
-        
-        return frame
-        
-    finally:
-        # Always release the camera
-        cap.release()
+    return cap
 
-def selectcropwindow(frame, window_name="Select Crop Window"):
-    """
-    Allow user to select a crop window on the given frame.
-   
-    Args:
-        frame (numpy.ndarray): The image frame to select from
-        window_name (str): Name of the window for display
-   
-    Returns:
-        tuple: Coordinates of the selected crop window (x, y, width, height)
-    """
-    # Display the image
+
+def capture_image_from_camera(cap, filename=None, save_image=True):
+    """Capture image from an already opened camera"""
+    ret, frame = cap.read()
+
+    if not ret or frame is None:
+        raise RuntimeError("Failed to capture image from camera")
+
+    if save_image:
+        if filename is None:
+            filename = 'captured_image.jpg'
+
+        directory = os.path.dirname(filename)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+
+        success = cv2.imwrite(filename, frame)
+        if not success:
+            raise RuntimeError(f"Failed to save image to {filename}")
+
+        print(f"Image saved as {filename}")
+
+    return frame
+
+
+def select_crop_window(frame, window_name="Select ROI"):
     cv2.imshow(window_name, frame)
-   
-    # Wait for user to select a region
+    print("Select a region of interest and press SPACE or ENTER to confirm")
     r = cv2.selectROI(window_name, frame, fromCenter=False, showCrosshair=True)
-   
-    # Wait for any key press and close the window
-    cv2.waitKey(0)
     cv2.destroyWindow(window_name)
-   
-    return r  # Returns (x, y, width, height)
+    return tuple(map(int, r))
 
 
-def binarize_image(image, thresh=127):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
-    return binary
+def binarize(img, threshold=127):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+    return binary, gray  # Now returns both binary and grayscale
 
-def crop_image(image, x, y, w, h):
-    return image[y:y+h, x:x+w]
 
-def calc_white_black_area(binary_img):
-    white = np.count_nonzero(binary_img == 255)
-    black = np.count_nonzero(binary_img == 0)
-    return white, black
+def analyse(binary_img, gray_img):
+    h, w = binary_img.shape
+    white_area = int((binary_img == 255).sum())
+    black_area = int((binary_img == 0).sum())
 
-def analyze_black_shapes(binary_img, min_size=60):
-    """
-    Analyze black shapes in the image and return detailed information
-    including area, perimeter, and bounding boxes.
-    """
-    # Invert so that black shapes become the foreground
-    inv = cv2.bitwise_not(binary_img)
-    _, inv_bin = cv2.threshold(inv, 127, 255, cv2.THRESH_BINARY)
+    white_fraction = (binary_img == 255).sum(axis=1) / w
+    transition_rows = np.where(white_fraction >= 0.5)[0]
     
-    # Get connected components with stats
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(inv_bin, connectivity=8)
+    # Handle edge cases properly
+    if transition_rows.size == 0:
+        # All black image - no rows with >= 50% white
+        transition_y = h - 1  # Bottom row (instead of out-of-bounds h)
+    elif transition_rows[0] == 0 and white_fraction[0] >= 0.9:
+        # Likely all or mostly white image
+        transition_y = 0
+    else:
+        # Normal case - first row where white pixels dominate
+        transition_y = int(transition_rows[0])
     
-    shapes_info = []
+    # Ensure transition_y is within valid bounds
+    transition_y = max(0, min(transition_y, h - 1))
+
+    white_height = h - transition_y
+    black_height = transition_y
+
+    # NEW: Divide image into 10 vertical sections and compute average grayscale
+    section_height = h // 10
+    section_averages = []
     
-    # Skip label 0 (background)
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
+    for i in range(10):
+        start_y = i * section_height
+        if i == 9:  # Last section includes any remaining pixels
+            end_y = h
+        else:
+            end_y = (i + 1) * section_height
         
-        if area >= min_size:
-            # Get bounding box coordinates
-            x = stats[i, cv2.CC_STAT_LEFT]
-            y = stats[i, cv2.CC_STAT_TOP]
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            
-            # Create mask for this specific component
-            component_mask = (labels == i).astype(np.uint8) * 255
-            
-            # Find contours to calculate perimeter
-            contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Calculate perimeter (should be only one contour per component)
-            perimeter = cv2.arcLength(contours[0], True) if contours else 0
-            
-            shapes_info.append({
-                'area': area,
-                'perimeter': perimeter,
-                'bbox': (x, y, w, h),
-                'centroid': (int(centroids[i][0]), int(centroids[i][1]))
-            })
-    
-    return shapes_info
+        section = gray_img[start_y:end_y, :]
+        avg_gray = np.mean(section)
+        section_averages.append(avg_gray)
 
-def draw_bounding_boxes(image, shapes_info, color=(0, 255, 0), thickness=2):
-    """
-    Draw bounding boxes and information on the image.
-    """
-    output_img = image.copy()
+    return white_height, black_height, black_area, white_area, transition_y, section_averages
+
+
+def output(binary_img, transition_y, output_filename):
+    vis = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
+    h, w = vis.shape[:2]
     
-    # Convert to BGR if grayscale
-    if len(output_img.shape) == 2:
-        output_img = cv2.cvtColor(output_img, cv2.COLOR_GRAY2BGR)
+    # Ensure line is drawn within image bounds
+    line_y = max(0, min(transition_y, h - 1))
+    cv2.line(vis, (0, line_y), (w, line_y), (0, 0, 255), 2)
     
-    for i, shape in enumerate(shapes_info):
-        x, y, w, h = shape['bbox']
-        cv2.rectangle(output_img, (x, y), (x + w, y + h), color, thickness)
+    cv2.imwrite(str(output_filename), vis)
+
+
+def experimentloop(cap, interval=60, count=120):
+    """Main experiment loop with persistent camera connection"""
+    global crop_coords, csv_path, captures_dir, output_dir
+
+    start_time = time.time()
+
+    for i in range(1, count + 1):
+        elapsed_min = (time.time() - start_time) / 60
+        filename = captures_dir / f"capture_{i:03d}.jpg"
         
-        # Add shape number and area as text
-        text = f"#{i+1} A:{shape['area']}"
-        cv2.putText(output_img, text, (x, y - 5), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-    
-    return output_img
+        # Capture image from the persistent camera connection
+        frame = capture_image_from_camera(cap, filename=str(filename), save_image=True)
 
-def calculate_averages(shapes_info):
-    """
-    Calculate average area and perimeter of shapes.
-    """
-    if not shapes_info:
-        return 0, 0
-    
-    total_area = sum(shape['area'] for shape in shapes_info)
-    total_perimeter = sum(shape['perimeter'] for shape in shapes_info)
-    count = len(shapes_info)
-    
-    avg_area = total_area / count
-    avg_perimeter = total_perimeter / count
-    
-    return avg_area, avg_perimeter
+        x, y, w, h = crop_coords
+        crop_frame = frame[y:y+h, x:x+w]
+        binary_img, gray_img = binarize(crop_frame)  # Now gets both images
+        white_h, black_h, black_a, white_a, trans_y, section_avgs = analyse(binary_img, gray_img)
+        
+        total_pixels = w * h
+
+        output_file = output_dir / f"output_{i:03d}.jpg"
+        output(binary_img, trans_y, output_file)
+
+        # Prepare row with section averages
+        row_data = [
+            datetime.now().isoformat(), f"{elapsed_min:.2f}", black_a, white_a,
+            black_h, white_h, trans_y, h, f"{white_a / (w*h):.4f}"
+        ]
+        # Add the 10 section averages
+        row_data.extend([f"{avg:.2f}" for avg in section_avgs])
+
+        with open(csv_path, "a", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(row_data)
+
+        print(f"[Img {i}] Elapsed: {elapsed_min:.2f} min | Black Area: {black_a}, White Area: {white_a}, Threshold Y: {trans_y}")
+        print(f"   Section averages (0-255): {[f'{avg:.1f}' for avg in section_avgs]}")
+        
+        # Log potential edge cases
+        if white_a == 0:
+            print(f"   ⚠️  All black image detected")
+        elif white_a == total_pixels:
+            print(f"   ⚠️  All white image detected")
+        elif trans_y == 0:
+            print(f"   ℹ️  Transition at top of image")
+        elif trans_y == h - 1:
+            print(f"   ℹ️  Transition at bottom of image")
+
+        next_capture_time = start_time + (i * interval)
+        time_to_wait = next_capture_time - time.time()
+        if time_to_wait > 0:
+            time.sleep(time_to_wait)
+
 
 def main():
-    timestamp = time.strftime("%m-%d_%H_%M")
-    base_folder = timestamp
-    
-    # Create the main folder and subfolders
-    captured_folder = os.path.join(base_folder, "captured")
-    output_folder = os.path.join(base_folder, "output")
-    
-    # Create directories if they don't exist
-    os.makedirs(captured_folder, exist_ok=True)
-    os.makedirs(output_folder, exist_ok=True)
-    
-    print(f"Created folders: {base_folder}/captured and {base_folder}/output")
-    
-    # === USER SETTINGS ===
-    min_shape_size = 60                # minimum pixel count for a connected shape
-    thresh_value = 127                 # binarization threshold (0–255)
-    interval_seconds = 60              # capture interval
-    # ======================
-    
-    start_time = time.time()
-    counter = 1
-    
-    # Wait for the first interval
-    wait = interval_seconds - ((time.time() - start_time) % interval_seconds)
-    time.sleep(wait)
-    
-    # CSV for general data
-    csv_path = os.path.join(output_folder, "data.csv")
-    csv_file = open(csv_path, "w", newline="")
-    writer = csv.writer(csv_file)
-    writer.writerow(["elapsed_time_s", "white_area", "black_area", "num_shapes", 
-                     "avg_shape_area", "avg_shape_perimeter"])
-    
-    # CSV for detailed shape data
-    shapes_csv_path = os.path.join(output_folder, "shapes_detail.csv")
-    shapes_csv_file = open(shapes_csv_path, "w", newline="")
-    shapes_writer = csv.writer(shapes_csv_file)
-    shapes_writer.writerow(["image_num", "shape_num", "area", "perimeter", 
-                            "bbox_x", "bbox_y", "bbox_w", "bbox_h"])
-    
-    print(f"Starting capture every {interval_seconds} seconds...")
+    global crop_coords, csv_path, captures_dir, output_dir, camera_index
 
-    counter_max = 120
+    base_dir = Path("experiments")  # Main experiments folder
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    experiment_dir = base_dir / f"experiment_{timestamp}"
 
-    
+    # Create subdirectories
+    captures_dir = experiment_dir / "captures"
+    output_dir = experiment_dir / "output"
+    csv_path = experiment_dir / "results.csv"
+
+    # Create all directories
+    captures_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(csv_path, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        headers = [
+            'timestamp', 'elapsed_min', 'black_area', 'white_area',
+            'black_height', 'white_height', 'transition_y', 'total_height', 'white_percentage'
+        ]
+        # Add headers for 10 sections
+        headers.extend([f'section_{i}_avg' for i in range(10)])
+        writer.writerow(headers)
+
+    # Initialize camera once
+    print("Initializing camera...")
+    cap = initialize_camera(camera_index)
     
     try:
-        while counter <= counter_max:
-
-            try:
-                # 1) Capture
-                frame = capture_image()
-                now = time.time()
-                elapsed = now - start_time
-                counter
-                # 2) Save original
-                filename = os.path.join(captured_folder, f"img_{counter}.jpeg")
-                cv2.imwrite(filename, frame)
-            except:
-                print(f"Error capturing image {counter}. Retrying...")
-                continue
+        # Capture test frame for ROI selection
+        test_frame = capture_image_from_camera(cap, save_image=False)
+        crop_coords = select_crop_window(test_frame)
         
-            # 3) Binarize
-            try:                
-                # 4) Crop
-                crop = crop_image(binary, x, y, w, h)
-                binary = binarize_image(frame, thresh_value)
-                # 5) Compute areas
-                white_area, black_area = calc_white_black_area(crop)
-                
-                # 6) Analyze shapes (get detailed info)
-                shapes_info = analyze_black_shapes(crop, min_shape_size)
-                num_shapes = len(shapes_info)
-                
-                # 7) Calculate averages
-                avg_area, avg_perimeter = calculate_averages(shapes_info)
-                
-                # 8) Create output image with bounding boxes
-                # Draw on the cropped binary image
-                output_crop = draw_bounding_boxes(crop, shapes_info)
-                
-                # Also create full frame with crop region and bounding boxes
-                full_output = frame.copy()
-                # Draw crop region on full frame
-                cv2.rectangle(full_output, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                cv2.putText(full_output, "Crop Region", (x, y - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-                
-                # Save output images
-                crop_output_path = os.path.join(output_folder, f"crop_bbox_{counter}.jpeg")
-                full_output_path = os.path.join(output_folder, f"full_bbox_{counter}.jpeg")
-                cv2.imwrite(crop_output_path, output_crop)
-                cv2.imwrite(full_output_path, full_output)
-                
-                # Report
-                print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}]")
-                print(f"Img {counter}: white={white_area}, black={black_area}, shapes={num_shapes}")
-                print(f"Average shape area: {avg_area:.2f}, Average perimeter: {avg_perimeter:.2f}")
-                
-                # Write to main CSV
-                writer.writerow([f"{elapsed:.2f}", white_area, black_area, num_shapes, 
-                                f"{avg_area:.2f}", f"{avg_perimeter:.2f}"])
-                csv_file.flush()
-                
-                # Write shape data csv
-                for i, shape in enumerate(shapes_info):
-                    bbox_x, bbox_y, bbox_w, bbox_h = shape['bbox']
-                    shapes_writer.writerow([counter, i+1, shape['area'], f"{shape['perimeter']:.2f}",
-                                        bbox_x, bbox_y, bbox_w, bbox_h])
-                shapes_csv_file.flush()
-                print(f"Captured and processed image {counter} successfully.")
-            except Exception as e:
-                print(f"Error processing image {counter}: {e}")
-
-            # Wait until next exact interval
-            next_capture = start_time + counter * interval_seconds
-            time_to_wait = next_capture - time.time()
-            if time_to_wait > 0:
-                time.sleep(time_to_wait)
-                
-    except KeyboardInterrupt:
-        print("\nStopping capture...")
+        print("Starting experiment loop")
+        experimentloop(cap, interval=60, count=120)
+        
     finally:
-        csv_file.close()
-        shapes_csv_file.close()
-        print("CSV files closed.")
+        # Always release the camera, even if an error occurs
+        print("Releasing camera...")
+        cap.release()
+        cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
